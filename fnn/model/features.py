@@ -57,9 +57,11 @@ class Norm(Feature):
             small value added to denominator for numerical stability
         """
         super().__init__()
+
         self.groups = int(groups)
         self.eps = float(eps)
-        self._features = dict()
+
+        self.past = dict()
 
     def _init(self, inputs, outputs, units, streams):
         """
@@ -95,9 +97,9 @@ class Norm(Feature):
         self.gains.norm_dim = 0
 
     def _reset(self):
-        self._features.clear()
+        self.past.clear()
 
-    def features(self, stream):
+    def weight(self, stream):
         """
         Parameters
         ----------
@@ -109,9 +111,11 @@ class Norm(Feature):
         Tensor
             [U, O, I]
         """
-        features = self._features.get(stream)
+        if stream is None:
+            weights = [self.weight(stream=s) for s in range(self.streams)]
+            return torch.stack(weights, dim=0)
 
-        if features is None:
+        else:
             weight = self.weights[stream]
             gain = self.gains[stream]
 
@@ -119,11 +123,58 @@ class Norm(Feature):
             scale = (var * self.inputs + self.eps).pow(-0.5)
 
             weight = (weight - mean) * scale
-            features = torch.einsum("U O G I, U O G -> U O G I", weight, gain).flatten(start_dim=2)
+            return torch.einsum("U O G I, U O G -> U O G I", weight, gain).flatten(start_dim=2)
 
-            self._features[stream] = features
+    def forward(self, stream=None):
+        """
+        Parameters
+        ----------
+        stream : int | None
+            specific stream (int) or all streams (None)
 
-        return features
+        Returns
+        -------
+        Tensor
+            [U, O, I] -- stream is int
+                or
+            [S, U, O, I] -- stream is None
+        """
+        if self.past:
+            assert self.past["stream"] == stream
+            weight = self.past["weight"]
+
+        else:
+            self.past["stream"] = stream
+            self.past["weight"] = weight = self.weight(stream)
+
+        return weight
+
+
+class Vanilla(Feature):
+    """Vanilla Feature"""
+
+    def _init(self, inputs, outputs, units, streams):
+        """
+        Parameters
+        ----------
+        inputs : int
+            inputs per stream (I)
+        outputs : int
+            outputs per unit and stream (O)
+        units : int
+            number of units (U)
+        streams : int
+            number of streams (S)
+        """
+        self.inputs = int(inputs)
+        self.outputs = int(outputs)
+        self.units = int(units)
+        self.streams = int(streams)
+
+        weight = lambda: Parameter(torch.zeros([self.units, self.outputs, self.inputs]))
+        self.weights = ParameterList([weight() for _ in range(self.streams)])
+        self.weights.scale = self.units
+        self.weights.norm_dim = 2
 
     def forward(self, stream=None):
         """
@@ -140,10 +191,7 @@ class Norm(Feature):
             [S, U, O, I] -- stream is None
         """
         if stream is None:
-            features = [self.features(stream=s) for s in range(self.streams)]
-            features = torch.stack(features, dim=0)
+            return torch.stack(list(self.weights), dim=0)
 
         else:
-            features = self.features(stream=stream)
-
-        return features
+            return self.weights[stream]

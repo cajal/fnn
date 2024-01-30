@@ -66,8 +66,12 @@ class NetworkLoss(NetworkObjective):
         self.sample_stream = bool(sample_stream)
         self.burnin_frames = int(burnin_frames)
 
-        self._training = []
-        self._validation = []
+        self.log = dict(
+            training_objective=[],
+            training_regularize=[],
+            validation_objective=[],
+            validation_regularize=[],
+        )
 
     def __call__(self, units, stimuli, perspectives=None, modulations=None, training=True):
         """Perform an objective call
@@ -98,21 +102,36 @@ class NetworkLoss(NetworkObjective):
         )
         losses = list(losses)[self.burnin_frames :]
 
-        if training:
-            objective = torch.stack(losses).mean()
-            objective.backward()
+        regs = self.network.regularize()
+        if regs:
+            regs = torch.stack(regs)
+            rsum = regs.sum()
         else:
-            objective = np.stack(losses).mean()
+            regs = None
+            rsum = torch.tensor(0)
+
+        if training:
+            objective = torch.stack(losses).mean() + rsum
+            objective.backward()
+
+            obj = "training_objective"
+            reg = "training_regularize"
+
+        else:
+            objective = np.stack(losses).mean() + rsum.item()
+
+            obj = "validation_objective"
+            reg = "validation_regularize"
 
         objective = objective.item()
 
         if not np.isfinite(objective):
             raise ValueError("Non-finite objective")
 
-        if training:
-            self._training.append(objective)
-        else:
-            self._validation.append(objective)
+        self.log[obj].append(objective)
+
+        if regs is not None:
+            self.log[reg].append(regs.tolist())
 
     def step(self):
         """Perform an epoch step
@@ -122,17 +141,19 @@ class NetworkLoss(NetworkObjective):
         dict[str, float]
             epoch objectives
         """
-        objectives = dict()
+        ret = dict()
 
-        if self._training:
-            objectives["training_objective"] = np.mean(self._training)
-            self._training.clear()
+        for key in ["training_objective", "validation_objective"]:
+            if self.log[key]:
+                ret[key] = np.mean(self.log[key])
+                self.log[key].clear()
 
-        if self._validation:
-            objectives["validation_objective"] = np.mean(self._validation)
-            self._validation.clear()
+        for key in ["training_regularize", "validation_regularize"]:
+            if self.log[key]:
+                ret[key] = np.stack(self.log[key], 0).mean(0)
+                self.log[key].clear()
 
-        return objectives
+        return ret
 
 
 # -- Stimulus Objectives --
@@ -286,7 +307,6 @@ class Reconstruction(StimulusObjective):
             stream = None
 
         with self.network.train_context(training):
-
             losses = []
 
             inputs = zip(
@@ -297,7 +317,6 @@ class Reconstruction(StimulusObjective):
             )
 
             for frame, (stimulus, perspective, modulation, unit) in enumerate(inputs):
-
                 loss = self.network.loss(
                     stimulus=expand(stimulus),
                     perspective=perspective,
@@ -402,11 +421,9 @@ class Excitation(StimulusObjective):
             stream = None
 
         with self.network.train_context(training):
-
             losses = []
 
             for frame, stimulus in enumerate(self.stimulus()):
-
                 out = self.network(
                     stimulus=stimulus.unsqueeze(0),
                     perspective=self.perspective,

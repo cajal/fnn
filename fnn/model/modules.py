@@ -12,7 +12,6 @@ class Module(nn.Module):
             memo = set()
 
         for module in filter(lambda x: isinstance(x, Module), self.children()):
-
             if module in memo:
                 continue
             else:
@@ -32,6 +31,10 @@ class Module(nn.Module):
     def _restart(self):
         return
 
+    def _regularize(self):
+        return
+        yield
+
     def reset(self):
         def fn(module):
             module._reset()
@@ -46,7 +49,13 @@ class Module(nn.Module):
         all(self._iterate(fn))
         return self
 
-    def dropout(self, p: float = 0):
+    def regularize(self):
+        def fn(module):
+            yield from module._regularize()
+
+        return list(self._iterate(fn))
+
+    def dropout(self, p=0):
         from .elements import Dropout
 
         def fn(module):
@@ -56,19 +65,21 @@ class Module(nn.Module):
         all(self._iterate(fn))
         return self
 
-    def freeze(self, mode: bool = True):
+    def freeze(self, mode=True):
         def fn(module):
             module._frozen = bool(mode)
-            module.requires_grad_(not mode)
-            module.train(not mode)
 
         all(self._iterate(fn))
+
+        self.requires_grad_(not mode)
+        self.train(not mode)
+
         return self
 
-    def requires_grad_(self, requires_grad: bool = True):
+    def requires_grad_(self, requires_grad=True):
         return super().requires_grad_(requires_grad and not self.frozen)
 
-    def train(self, mode: bool = True):
+    def train(self, mode=True):
         return super().train(mode and not self.frozen)
 
     @property
@@ -82,7 +93,7 @@ class Module(nn.Module):
             return x.device
 
     @contextmanager
-    def train_context(self, mode: bool = True):
+    def train_context(self, mode=True):
         prev = self.training
         try:
             self.train(mode)
@@ -93,6 +104,14 @@ class Module(nn.Module):
                     yield
         finally:
             self.train(prev)
+
+    def module(self, name):
+        module = self
+
+        for _name in name.split("."):
+            module = getattr(module, _name)
+
+        return module
 
     def parallel_groups(self, group_size=1, shared=None):
         """
@@ -120,27 +139,19 @@ class Module(nn.Module):
         if not size > 1:
             return
 
-        shared = set() if shared is None else set(shared)
-        children = {k for k, _ in self.named_children()}
-
-        if shared - children:
-            raise ValueError("Shared module not recognized")
-
         shared_params = dict()
         group_params = dict()
 
-        for name in children:
+        if shared is not None:
+            for name in shared:
+                for key, param in self.module(name).named_parameters():
+                    if param.requires_grad:
+                        shared_params[f"{name}.{key}"] = param
 
-            module = getattr(self, name)
-
-            if module.frozen:
-                continue
-
-            elif name in shared:
-                shared_params.update({f"{name}.{k}": v for k, v in module.named_parameters()})
-
-            elif group_size > 1:
-                group_params.update({f"{name}.{k}": v for k, v in module.named_parameters()})
+        if group_size > 1:
+            for key, param in self.named_parameters():
+                if param.requires_grad and key not in shared_params:
+                    group_params[key] = param
 
         if shared_params:
             ranks = np.arange(size)

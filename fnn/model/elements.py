@@ -6,7 +6,7 @@ from functools import reduce
 from collections import deque
 from .parameters import Parameter, ParameterList
 from .modules import Module, ModuleList
-from .utils import add
+from .utils import add, cat_groups
 
 
 def nonlinearity(nonlinear=None):
@@ -137,6 +137,7 @@ class Conv(Module):
         gain=1,
         bias=0,
         eps=1e-5,
+        wnorm=True,
     ):
         """
         Parameters
@@ -151,9 +152,9 @@ class Conv(Module):
             output groups per stream
         streams : int
             number of streams
-        temporal_size : int
+        temporal : int
             temporal kernel size
-        spatial_size : int
+        spatial : int
             spatial kernel size
         stride : int
             spatial stride
@@ -165,6 +166,8 @@ class Conv(Module):
             initial bias value
         eps : float
             small value for numerical stability
+        wnorm : bool
+            enable weight norm
         """
         if in_channels % in_groups != 0:
             raise ValueError("Input channels must be divisible by input groups")
@@ -173,7 +176,7 @@ class Conv(Module):
             raise ValueError("Output channels must be divisible by input groups")
 
         if out_channels % out_groups != 0:
-            raise ValueError("Input channels must be divisible by input groups")
+            raise ValueError("Output channels must be divisible by output groups")
 
         if (spatial - stride) % 2 != 0:
             raise ValueError("Incompatible spatial_size and stride")
@@ -188,13 +191,18 @@ class Conv(Module):
         self.temporal = int(temporal)
         self.spatial = int(spatial)
         self.stride = int(stride)
+
         self.pad = None if pad is None else str(pad)
         self.padding = 0 if self.pad is None else (self.spatial - self.stride) // 2
+
         self.gain = gain is not None
         self.bias = bias is not None
+
         self.init_gain = float(gain) if self.gain else None
         self.init_bias = float(bias) if self.bias else None
+
         self.eps = float(eps)
+        self.wnorm = bool(wnorm)
 
         if self.pad is None:
             self.pad_fn = lambda x: x
@@ -213,7 +221,7 @@ class Conv(Module):
             self.spatial,
         ]
         self.fan_in = math.prod(shape[1:])
-        bound = 1 / math.sqrt(self.fan_in)
+        bound = math.sqrt(1 / self.fan_in) if self.wnorm else math.sqrt(3 / self.fan_in)
 
         def param():
             weight = torch.zeros(shape)
@@ -225,7 +233,7 @@ class Conv(Module):
 
         self.fan_out = self.out_channels // self.out_groups
 
-        if self.gain:
+        if self.wnorm and self.gain:
             gain = lambda: Parameter(torch.full([self.out_groups, self.fan_out], self.init_gain))
             self.gains = ParameterList([gain() for _ in range(streams)])
             self.gains.decay = False
@@ -253,7 +261,7 @@ class Conv(Module):
             weights = [self.weight(stream) for stream in range(self.streams)]
             return torch.cat(weights, dim=0)
 
-        else:
+        elif self.wnorm:
             weight = self.weights[stream]
             var, mean = torch.var_mean(weight, dim=[1, 2, 3, 4], keepdim=True, unbiased=False)
 
@@ -262,6 +270,9 @@ class Conv(Module):
                 scale = scale * self.gains[stream].view_as(scale)
 
             return (weight - mean) * scale
+
+        else:
+            return self.weights[stream]
 
     def forward(self, x, stream=None):
         """
@@ -342,6 +353,7 @@ class Linear(Conv):
         gain=1,
         bias=0,
         eps=1e-5,
+        wnorm=True,
     ):
         """
         Parameters
@@ -362,6 +374,8 @@ class Linear(Conv):
             initial bias value
         eps : float
             small value for numerical stability
+        wnorm : bool
+            enable weight norm
         """
         super().__init__(
             in_channels=in_features,
@@ -372,6 +386,7 @@ class Linear(Conv):
             gain=gain,
             bias=bias,
             eps=eps,
+            wnorm=wnorm,
         )
 
     def forward(self, x, stream=None):
@@ -549,3 +564,198 @@ class Accumulate(ModuleList):
         """
         assert len(x) == len(self)
         return add([module(_, stream=stream) for module, _ in zip(self, x)])
+
+
+class Lstm(Module):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        streams,
+        wnorm=True,
+        dropout=0,
+        init_input=-1,
+        init_forget=1,
+    ):
+        """
+        Parameters
+        ----------
+        in_features : int
+            input features per stream (I)
+        out_channels : int
+            output channels per stream (O)
+        streams : int
+            number of streams
+        wnorm : bool
+            enable weight norm
+        dropout : float
+            dropout probability -- [0, 1)
+        init_input : float
+            initial input gate bias
+        init_forget : float
+            initial forget gate bias
+        """
+        super().__init__()
+
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.streams = int(streams)
+        self.wnorm = bool(wnorm)
+
+        self._dropout = float(dropout)
+        self.drop_x = FlatDropout(p=self._dropout)
+        self.drop_h = FlatDropout(p=self._dropout)
+
+        self.proj_i = Linear(
+            in_features=self.in_features + self.out_features,
+            out_features=self.out_features,
+            streams=self.streams,
+            wnorm=self.wnorm,
+            bias=float(init_input),
+        )
+        self.proj_f = Linear(
+            in_features=self.in_features + self.out_features,
+            out_features=self.out_features,
+            streams=self.streams,
+            wnorm=self.wnorm,
+            bias=float(init_forget),
+        )
+        self.proj_g = Linear(
+            in_features=self.in_features + self.out_features,
+            out_features=self.out_features,
+            streams=self.streams,
+            wnorm=self.wnorm,
+        )
+        self.proj_o = Linear(
+            in_features=self.in_features + self.out_features,
+            out_features=self.out_features,
+            streams=self.streams,
+            wnorm=self.wnorm,
+        )
+        self.past = dict()
+
+    def _restart(self):
+        self.dropout(p=self._dropout)
+
+    def _reset(self):
+        self.past.clear()
+
+    def forward(self, x, stream=None):
+        """
+        Parameters
+        ----------
+        x : 4D Tensor
+            [N, I] -- stream is int
+                or
+            [N, S*I] -- stream is None
+        stream : int | None
+            specific stream (int) or all streams (None)
+
+        Returns
+        -------
+        Tensor
+            [N, O] -- stream is int
+                or
+            [N, S*O] -- stream is None
+        """
+        if stream is None:
+            S = self.streams
+        else:
+            S = 1
+
+        if self.past:
+            h = self.past["h"]
+            c = self.past["c"]
+        else:
+            h = c = torch.zeros([1, S * self.out_features], device=self.device)
+
+        x = self.drop_x(x)
+        xh = cat_groups([x, h], groups=S, expand=True)
+
+        i = torch.sigmoid(self.proj_i(xh, stream=stream))
+        f = torch.sigmoid(self.proj_f(xh, stream=stream))
+        g = torch.tanh(self.proj_g(xh, stream=stream))
+        o = torch.sigmoid(self.proj_o(xh, stream=stream))
+
+        c = f * c + i * g
+        h = o * torch.tanh(c)
+        h = self.drop_h(h)
+
+        self.past["c"] = c
+        self.past["h"] = h
+
+        return h
+
+
+class Mlp(Module):
+    def __init__(self, in_features, out_features, out_wnorms, out_nonlinears, streams=1):
+        """
+        Parameters
+        ----------
+        in_features : int
+            input features
+        out_features : Sequence[int]
+            output features
+        out_wnorms : Sequence[bool]
+            output weight norms
+        out_nonlinears : Sequence[int]
+            output nonlinearities
+        streams : int
+            number of streams
+        """
+        assert len(out_features) == len(out_wnorms) == len(out_nonlinears)
+        super().__init__()
+
+        self.in_features = int(in_features)
+        self.out_features = list(map(int, out_features))
+        self.out_wnorms = list(map(bool, out_wnorms))
+        self.out_nonlinears = list(out_nonlinears)
+        self.streams = int(streams)
+
+        self.linears = ModuleList()
+        self.nonlinears = ModuleList()
+        self.gammas = []
+
+        in_features = self.in_features
+
+        for features, wnorm, nonlinear in zip(
+            self.out_features,
+            self.out_wnorms,
+            self.out_nonlinears,
+        ):
+            linear = Linear(in_features=in_features, out_features=features, streams=streams, wnorm=wnorm)
+            in_features = features
+            self.linears.append(linear)
+
+            nonlinear, gamma = nonlinearity(nonlinear=nonlinear)
+            self.nonlinears.append(nonlinear)
+            self.gammas.append(gamma)
+
+    def forward(self, x, stream=None):
+        """
+        Parameters
+        ----------
+        x : 2D Tensor
+            [N, F] -- stream is int
+                or
+            [N, S*F] -- stream is None
+        stream : int | None
+            specific stream (int) or all streams (None)
+
+        Returns
+        -------
+        Tensor
+            [N, F'] -- stream is int
+                or
+            [N, S*F'] -- stream is None
+        """
+        for linear, nonlinear, gamma in zip(
+            self.linears,
+            self.nonlinears,
+            self.gammas,
+        ):
+            x = linear(x, stream=stream)
+            x = nonlinear(x)
+            x = x * gamma
+
+        return x
